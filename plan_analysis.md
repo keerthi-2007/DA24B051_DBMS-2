@@ -1,28 +1,24 @@
-# Plan Analysis 
+# Query Plan Analysis — DBMS Assignment 2
 
 ## 1. Overview
 
-This document analyses the execution plans of selected queries from the ScrollSense database using SQLite's `EXPLAIN QUERY PLAN`. It identifies table scans, index searches, temporary B-trees, and the effect of additional indexes.
+This document records the query execution plans and optimisation experiments conducted on the ScrollSense SQLite database. The main objective was to understand how SQLite executes the assignment queries, identify expensive operations, and evaluate whether suitable indexes and query rewrites improve performance.
 
-The analysis covers:
+The experiments were performed using DBeaver and SQLite's `EXPLAIN QUERY PLAN`. Execution times are observations from the local environment, so they may vary with caching, database state, and result-fetching overhead.
 
-- **Task 1:** Original execution plans and scan-cost estimation.
-- **Task 2:** Index selection and before/after execution-plan comparisons.
-- **Task 3:** Join plans, cardinality estimates, and theoretical join-cost comparison.
-- **Task 4:** Predicate pushdown and observed execution time.
-- **Task 5:** Transaction behaviour and concurrency observations.
-
-All plans and timings below are based on the observed database experiments. Timing results may include query execution and result-fetching overhead from DBeaver.
+The original queries are retained in `queries.sql`. The additional indexes used in the experiments are defined in `indexes.sql`.
 
 ---
 
-## 2. Task 1 — Original Query Plans
+## 2. Baseline Query Plans
 
-### 2.1 F1 — Audio Track Engagement
+Before adding the new indexes, I inspected the execution plans for F1, F2, and F12. These plans help identify the tables SQLite scans, the indexes it uses, and operations that may require additional temporary storage.
 
-F1 joins `impressions` with `videos`, filters impressions by timestamp and non-null audio track, groups by audio track, and returns the top 10 tracks by distinct video count.
+### 2.1 F1 — Audio-track popularity
 
-#### Original execution plan
+F1 joins impressions with videos, filters impressions from the rolling seven-day window with a non-null audio track, counts distinct videos per audio track, and returns the top 10 results.
+
+**Baseline execution plan:**
 
 ```text
 SCAN i USING COVERING INDEX ix_impressions_video_time
@@ -32,22 +28,13 @@ USE TEMP B-TREE FOR count(DISTINCT)
 USE TEMP B-TREE FOR ORDER BY
 ```
 
-#### Analysis
+**Analysis:** SQLite scans the existing impressions index and looks up the corresponding video for each matching row. It then uses temporary B-trees for grouping, counting distinct videos, and sorting the results. These operations contribute to the query's cost.
 
-- SQLite scans `ix_impressions_video_time` rather than performing a selective timestamp range search.
-- For each matching impression, it searches `videos` using the primary-key index on `video_id`.
-- Temporary B-trees are used for grouping, computing `COUNT(DISTINCT ...)`, and sorting the results.
-- The original index begins with `video_id`, so it is not ideal for a query whose main selective predicate is on `occurred_at`.
+### 2.2 F2 — Creator-level statistics
 
-**Potential improvement:** Add a composite index beginning with `occurred_at` and including `video_id`.
+F2 joins creators, users, videos, impressions, and viewing segments to calculate creator-level statistics. The query uses left joins to retain creators even when matching records are absent.
 
----
-
-### 2.2 F2 — Creator and Viewing Analytics
-
-F2 joins creators, users, videos, impressions, and viewing segments to compute creator-level analytics.
-
-#### Original execution plan
+**Baseline execution plan:**
 
 ```text
 SCAN c USING INDEX sqlite_autoindex_creators_1
@@ -61,25 +48,13 @@ USE TEMP B-TREE FOR count(DISTINCT)
 USE TEMP B-TREE FOR ORDER BY
 ```
 
-#### Analysis
+**Analysis:** SQLite starts with creators and performs indexed lookups in the related tables. However, the joins can produce a large intermediate result, and the distinct counts require temporary B-trees. Sorting the final results also requires a temporary B-tree.
 
-- SQLite scans creators and looks up the corresponding user rows through the user primary-key index.
-- Videos are accessed using the index on `moderation_state`.
-- Impressions and viewing segments are accessed through indexes on their join columns.
-- The three distinct-count aggregates and final ordering require temporary B-trees.
-- Although indexes are used, the query can still be expensive because of the large number of joined rows and distinct aggregations.
+### 2.3 F12 — Sessions and completed viewing
 
-**Potential improvement:** Add a composite index on `videos(creator_id, moderation_state)` to support lookups using both the creator and moderation state.
+F12 joins sessions, turns, recommendations, impressions, and viewing segments, filtering for viewing segments where `reached_end = 1`.
 
-The full F2 query was very expensive in the observed experiment. No reliable before/after full-query runtime comparison was obtained, so a full-query speedup is not claimed.
-
----
-
-### 2.3 F12 — Completed Viewing Sessions
-
-F12 joins sessions, turns, recommendations, impressions, and viewing segments, filtering for rows where `reached_end = 1`.
-
-#### Original execution plan
+**Baseline execution plan:**
 
 ```text
 SCAN vs
@@ -90,64 +65,65 @@ SEARCH s USING INDEX sqlite_autoindex_sessions_1 (session_id=?)
 USE TEMP B-TREE FOR DISTINCT
 ```
 
-#### Analysis
-
-- SQLite scans the `viewing_segments` table.
-- It then performs indexed lookups into impressions, recommendations, turns, and sessions.
-- The scan is a potential bottleneck because `viewing_segments` contains approximately 7.35 million rows.
-- A composite index beginning with `reached_end` can help SQLite locate qualifying rows and provide `impression_id` for the subsequent join.
-
-**Potential improvement:** Add a composite index on `viewing_segments(reached_end, impression_id)`.
+**Analysis:** The plan begins by scanning the viewing segments table and then looks up related records using indexes. Since viewing segments contains millions of rows, scanning the table is a potentially expensive operation. This motivated testing an index that starts with the `reached_end` filter.
 
 ---
 
-## 3. Task 1 — Scan-Cost Estimation
+## 3. Task 1 — Database Size and Scan-Cost Estimate
 
-The following values were measured from the database:
+The viewing segments table contains **7,350,347 rows**. The database page size is **4,096 bytes**, and the reported database allocation was approximately **700,424,192 bytes**.
 
-| Metric | Value |
-|---|---:|
-| Rows in `viewing_segments` | 7,350,347 |
-| SQLite page size | 4,096 bytes |
-| Allocated bytes reported by `dbstat` | 700,424,192 bytes |
-| Average allocated bytes per row | Approximately 95.29 bytes |
-
-The average allocated bytes per row are estimated as:
+Using these values, the average allocated space per row is approximately:
 
 \[
 \frac{700,424,192}{7,350,347}
-\approx 95.29 \text{ bytes/row}
+\approx 95.29\text{ bytes per row}
 \]
 
-Using this average, the estimated number of rows per 4,096-byte page is:
+An approximate estimate of the number of rows that fit on a page is:
 
 \[
-\left\lfloor\frac{4096}{95.29}\right\rfloor=42
+\left\lfloor \frac{4096}{95.29}\right\rfloor
+=42
 \]
 
-The approximate number of pages required for a full scan is therefore:
+The estimated number of pages is therefore:
 
 \[
 \left\lceil\frac{7,350,347}{42}\right\rceil
-=175,009
+\approx 175,009\text{ pages}
 \]
 
-These are approximate estimates, not exact physical page counts for the table. The `dbstat` allocation can include B-tree and record overhead, unused space, and other storage effects. The estimate is useful for understanding the scale of scanning the table, but it should not be interpreted as an exact I/O count.
+These figures are estimates rather than an exact SQLite page-level scan count. Actual page occupancy depends on record headers, B-tree structure, free space, and other database overhead.
+
+The estimate nevertheless illustrates why a full scan of a multi-million-row table can be expensive.
 
 ---
 
-## 4. Task 2 — Index Selection and Execution-Plan Changes
+## 4. Task 2 — Index Optimisation
 
-### 4.1 F1 — Timestamp-Based Filtering
+I tested three additional indexes targeting the access patterns observed in F1, F2, and F12.
 
-#### Index added
+### 4.1 Index definitions
+
+The following indexes were added:
 
 ```sql
 CREATE INDEX idx_impressions_time_video
 ON impressions(occurred_at, video_id);
+
+CREATE INDEX idx_f2_videos_creator_state
+ON videos(creator_id, moderation_state);
+
+CREATE INDEX idx_vs_reached_impression
+ON viewing_segments(reached_end, impression_id);
 ```
 
-#### Before adding the index
+The indexes were designed around the query filters and join conditions rather than adding indexes indiscriminately.
+
+### 4.2 F1 — Plan before and after indexing
+
+**Before:**
 
 ```text
 SCAN i USING COVERING INDEX ix_impressions_video_time
@@ -157,7 +133,7 @@ USE TEMP B-TREE FOR count(DISTINCT)
 USE TEMP B-TREE FOR ORDER BY
 ```
 
-#### After adding the index
+**After:**
 
 ```text
 SEARCH i USING COVERING INDEX idx_impressions_time_video (occurred_at>?)
@@ -167,73 +143,50 @@ USE TEMP B-TREE FOR count(DISTINCT)
 USE TEMP B-TREE FOR ORDER BY
 ```
 
-#### Analysis
+The main change is that SQLite can search the new index using the `occurred_at` range condition instead of scanning the existing impressions index. The grouping, distinct-counting, and sorting operations remain unchanged.
 
-The important change is from a full index scan to a range search on `occurred_at`. Because `occurred_at` is the leading column of the new composite index, SQLite can navigate to the relevant timestamp range instead of scanning the entire existing index.
+**Observed timings:**
 
-The lookup into `videos` and the temporary B-trees remain because the join, grouping, distinct count, and ordering requirements have not changed.
-
-For a fixed diagnostic cutoff of `'2026-09-07'`, the observed timings were:
-
-| Configuration | Observed time |
+| Configuration | Execution time |
 |---|---:|
-| Without the new index | Approximately 20 seconds |
-| With the new index | Approximately 2.354 seconds |
+| Without the new index | 20.000 s |
+| With the new index | 2.354 s |
 
-The measured query time was approximately 8.5 times lower with the new index in this experiment. These timings are approximate and may include DBeaver result-fetching overhead.
+The observed query time decreased substantially, corresponding to an approximate speedup of:
 
-**Note:** The dataset's maximum `occurred_at` was `2026-09-13T23:59:53Z`, while the rolling seven-day query was being evaluated around October 2026. Consequently, the original rolling-window query returned zero rows for that data. The fixed cutoff was used for the diagnostic comparison and should not be confused with a change to the original query's intended logic.
+\[
+\frac{20.000}{2.354}\approx 8.50\times
+\]
 
----
+These are measured local timings, not a guarantee of the same speedup on other systems.
 
-### 4.2 F2 — Creator and Moderation-State Lookup
+**Date-filter caveat:** The latest timestamp in the generated dataset was `2026-09-13T23:59:53Z`, while the experiment was conducted in October 2026. Consequently, the rolling seven-day query returned zero rows. I used a fixed cutoff of `2026-09-07` for diagnostic comparison. The zero-row result and the diagnostic timing should be interpreted in the context of this timestamp range.
 
-#### Index added
+### 4.3 F2 — Plan after indexing
 
-```sql
-CREATE INDEX idx_f2_videos_creator_state
-ON videos(creator_id, moderation_state);
-```
+The new composite index was intended to support the creator join and moderation-state condition together.
 
-#### Before adding the index
-
-The video lookup used:
-
-```text
-SEARCH v USING INDEX ix_videos_moderation_state (moderation_state=?) LEFT-JOIN
-```
-
-#### After adding the index
-
-The video lookup changed to:
+**Relevant lines from the plan after indexing:**
 
 ```text
 SEARCH v USING INDEX idx_f2_videos_creator_state
 (creator_id=? AND moderation_state=?) LEFT-JOIN
+SEARCH i USING INDEX ix_impressions_video_time (video_id=?) LEFT-JOIN
+SEARCH vs USING INDEX ix_viewing_segments_impression (impression_id=?) LEFT-JOIN
+USE TEMP B-TREE FOR ORDER BY
 ```
 
-The remaining impression and viewing-segment lookups continued to use their existing indexes.
+SQLite uses the composite index for the videos lookup, applying both the creator and moderation-state conditions. The existing indexes continue to support the impressions and viewing-segments lookups.
 
-#### Analysis
+F2 remained expensive in this dataset. The full query had previously taken approximately 1 hour, 59 minutes, and 9 seconds in one run; a count-wrapper experiment took approximately 1 hour, 28 minutes, and 31 seconds. These are not a controlled before-and-after pair, so they do not establish a reliable full-query speedup.
 
-The composite index supports a lookup involving both `creator_id` and `moderation_state`. This is more directly aligned with the combined conditions than using an index whose leading column is only `moderation_state`.
+A smaller diagnostic lookup returned 18 rows in both tested cases, with observed timings of approximately 0.003 s and 0.002 s. This supports the correctness of that diagnostic comparison but should not be treated as a benchmark of the entire F2 query.
 
-However, the full F2 query took a very long time in the experiments, and a reliable paired full-query timing comparison was not obtained. Small diagnostic count queries returned 18 rows in both tested configurations, with observed times around 0.003 seconds and 0.002 seconds. These diagnostic timings do not establish a full-query performance improvement.
+### 4.4 F12 — Plan after indexing
 
-The index is therefore justified by the execution-plan change, not by a proven full-query speedup.
+The index on `(reached_end, impression_id)` was intended to support both the completion filter and the subsequent lookup by impression ID.
 
----
-
-### 4.3 F12 — Filtering Completed Viewing Segments
-
-#### Index added
-
-```sql
-CREATE INDEX idx_vs_reached_impression
-ON viewing_segments(reached_end, impression_id);
-```
-
-#### Before adding the index
+**Before:**
 
 ```text
 SCAN vs
@@ -244,7 +197,7 @@ SEARCH s USING INDEX sqlite_autoindex_sessions_1 (session_id=?)
 USE TEMP B-TREE FOR DISTINCT
 ```
 
-#### After adding the index
+**After:**
 
 ```text
 SEARCH vs USING COVERING INDEX idx_vs_reached_impression (reached_end=?)
@@ -255,172 +208,114 @@ SEARCH s USING INDEX sqlite_autoindex_sessions_1 (session_id=?)
 USE TEMP B-TREE FOR DISTINCT
 ```
 
-#### Analysis
+The important improvement in the plan is the change from scanning `viewing_segments` to searching the index for rows matching `reached_end = 1`. The remaining joins and the distinct operation are still present.
 
-The original plan scanned `viewing_segments`. The new plan searches the composite index using `reached_end` and can obtain `impression_id` from the same index.
+Both runs returned **210,602 rows**. The recorded timings were 1 minute 19 seconds without the new index and 2 minutes 13 seconds with it. Since these timings were not obtained under controlled, identical conditions, they do not establish that the index makes F12 slower. They do show that an improved-looking plan does not automatically guarantee a lower observed runtime in every experiment.
 
-The composite index was chosen instead of an index on `reached_end` alone because the query both filters on `reached_end` and joins using `impression_id`.
+### 4.5 Index trade-offs
 
-The full query returned 210,602 rows in both experiments. The observed times were approximately 1 minute 19 seconds without the new index and 2 minutes 13 seconds with it. Since these measurements include uncontrolled execution and result-fetching effects, the timing difference is not treated as evidence that the index makes the query slower. The clear observed improvement is the execution-plan change from scanning `viewing_segments` to searching the composite index.
+Indexes can reduce the amount of data SQLite needs to scan, but they also consume storage and add work during inserts, updates, and deletes. The new indexes should therefore be evaluated based on the queries they help, the workload's write activity, and their storage cost.
+
+The composite index on viewing segments was preferred over an index on `reached_end` alone because it also contains `impression_id`, which is used in the following join.
 
 ---
 
-## 5. Task 3 — Join Plan Analysis
+## 5. Task 3 — Join Plans and Cost Analysis
 
-### 5.1 Join: Impressions and Viewing Segments
+This task examines how SQLite executes joins and compares simplified theoretical costs for different join algorithms.
 
-#### Query
+### 5.1 Join 1 — Impressions and viewing segments
+
+**Query:**
 
 ```sql
 EXPLAIN QUERY PLAN
-SELECT i.impression_id,
-       i.video_id,
-       vs.watch_seconds,
-       vs.reached_end
+SELECT i.impression_id, i.video_id,
+       vs.watch_seconds, vs.reached_end
 FROM impressions AS i
 JOIN viewing_segments AS vs
   ON vs.impression_id = i.impression_id;
 ```
 
-#### Observed plan
+**Observed plan:**
 
 ```text
 SCAN vs
 SEARCH i USING INDEX sqlite_autoindex_impressions_1 (impression_id=?)
 ```
 
-#### Analysis
+SQLite scans viewing segments and looks up the matching impression using the primary-key index. This is an indexed nested-loop-style plan: for each row from the outer input, SQLite performs an indexed lookup in the other table.
 
-SQLite scans `viewing_segments` and uses the primary-key index on `impressions.impression_id` to look up the matching impression for each viewing segment.
+The relevant table cardinalities are:
 
-This is an indexed nested-loop-style plan. The `EXPLAIN QUERY PLAN` output shows a scan followed by indexed searches; it does not explicitly print the name of the join algorithm.
+- Impressions: 15,000,000 rows
+- Viewing segments: 7,350,347 rows
 
-The main cost is potentially the scan of the large `viewing_segments` relation.
+A naive nested-loop join without an index could require approximately:
 
----
+\[
+15,000,000\times7,350,347
+\approx 1.103\times10^{14}
+\]
 
-### 5.2 Join: Impressions and Recommendations
+tuple-pair comparisons. This is an illustrative worst-case comparison count, not the actual work performed by SQLite's indexed plan.
 
-#### Query
+For comparison, a simplified sort-merge estimate is:
+
+\[
+N\log_2N+M\log_2M+(N+M)
+\]
+
+Using the two relation sizes gives approximately 547.6 million abstract work units. A simplified hash-join estimate is \(N+M\), or approximately 22.35 million row-processing units, assuming sufficient memory and ignoring implementation overhead.
+
+These estimates are useful for understanding algorithmic differences, but their work units are not directly comparable to measured SQLite execution time.
+
+### 5.2 Join 2 — Impressions and recommendations
+
+**Query:**
 
 ```sql
 EXPLAIN QUERY PLAN
-SELECT i.impression_id,
-       i.user_id,
-       i.video_id,
-       r.turn_id
+SELECT i.impression_id, i.user_id,
+       i.video_id, r.turn_id
 FROM impressions AS i
 JOIN recommendations AS r
   ON r.video_id = i.video_id;
 ```
 
-#### Observed plan
+**Observed plan:**
 
 ```text
 SCAN r USING COVERING INDEX sqlite_autoindex_recommendations_3
 SEARCH i USING INDEX ix_impressions_video_time (video_id=?)
 ```
 
-#### Analysis
+SQLite scans the recommendations index and uses the existing impressions index to find matching records by video ID. The plan therefore uses an indexed lookup rather than comparing every recommendation against every impression.
 
-SQLite scans the recommendations index and uses `ix_impressions_video_time` to search impressions by `video_id`.
+### 5.3 Join order and intermediate results
 
-The plan uses an indexed search rather than an explicit full scan of impressions for every recommendation. The recommendations index is covering for the columns SQLite needs from that side of the join.
+The relevant table sizes in the session-related analysis were:
 
----
-
-### 5.3 Approximate Join-Cost Comparison
-
-The measured relation sizes were:
-
-| Relation | Rows |
+| Relation or join | Row count |
 |---|---:|
-| `impressions` | 15,000,000 |
-| `viewing_segments` | 7,350,347 |
+| Sessions | 100,000 |
+| Turns | 349,279 |
+| Recommendations | 524,801 |
+| Sessions joined with turns | 349,279 |
+| Turns joined with recommendations | 524,801 |
+| Full join result | 524,801 |
 
-For illustration, let:
+Starting with sessions and joining turns can produce an intermediate result of 349,279 rows. The observed SQLite plan for the related query instead began with recommendations, then looked up turns and sessions.
 
-\[
-N=15,000,000,\qquad M=7,350,347
-\]
-
-#### Unindexed nested-loop comparison
-
-A basic unindexed nested-loop comparison has a rough pairwise work estimate of:
-
-\[
-N\times M
-=15,000,000\times7,350,347
-\approx1.103\times10^{14}
-\]
-
-This is approximately 110.3 trillion tuple-pair comparisons.
-
-#### Sort-merge comparison
-
-Using the simplified estimate \(N\log_2N+M\log_2M+(N+M)\):
-
-\[
-N\log_2N\approx357.6\text{ million}
-\]
-
-\[
-M\log_2M\approx167.7\text{ million}
-\]
-
-\[
-N+M=22,350,347
-\]
-
-The combined estimate is approximately 547.6 million abstract work units.
-
-#### Hash-join comparison
-
-Under the simplified assumption of suitable memory and efficient hashing, the estimate is:
-
-\[
-N+M=22,350,347
-\]
-
-or approximately 22.35 million abstract work units.
-
-#### Interpretation
-
-These figures illustrate the theoretical differences between the simplified algorithms. They are not directly comparable measurements of CPU instructions or disk I/O, and they do not prove that SQLite would execute a hash join faster for this database.
-
-The observed SQLite plans use indexed lookups. The existing indexes and actual data distribution influence the cost of these plans.
-
----
-
-### 5.4 Join Order and Intermediate Cardinalities
-
-The observed relation sizes were:
-
-| Relation | Rows |
-|---|---:|
-| `sessions` | 100,000 |
-| `turns` | 349,279 |
-| `recommendations` | 524,801 |
-
-The observed intermediate cardinalities were:
-
-| Join | Result rows |
-|---|---:|
-| `sessions JOIN turns` | 349,279 |
-| `turns JOIN recommendations` | 524,801 |
-| Complete join | 524,801 |
-
-Joining sessions to turns first creates an intermediate result of 349,279 rows, which is smaller than the observed 524,801-row intermediate result for turns joined with recommendations.
-
-This provides a possible reason to investigate a sessions-first join order. However, intermediate cardinality alone does not prove that this order is faster: index availability, join selectivity, row width, and the cost of subsequent joins also matter.
-
-The observed SQLite plan began with recommendations and then searched turns and sessions. No claim is made that the alternative order would necessarily improve runtime.
+The smaller intermediate result alone does not prove that a join order is faster. The optimizer must also consider available indexes, selectivity, lookup costs, and the cost of later operations. SQLite's chosen plan is the actual plan reported by `EXPLAIN QUERY PLAN`; the alternative is a theoretical comparison rather than a measured improvement.
 
 ---
 
 ## 6. Task 4 — Predicate Pushdown
 
-### 6.1 Original Query
+The original query joins turns with judge scores and user ratings, filters for helpfulness greater than 4 and a `thumbs_down` rating, and sorts by session and turn number.
+
+### 6.1 Original query
 
 ```sql
 SELECT t.turn_id,
@@ -439,9 +334,7 @@ WHERE js.helpfulness > 4
 ORDER BY t.session_id, t.turn_number;
 ```
 
-### 6.2 Rewritten Query
-
-The rewritten version applies the predicates inside subqueries before joining:
+### 6.2 Rewritten query with filters pushed down
 
 ```sql
 SELECT t.turn_id,
@@ -466,88 +359,47 @@ JOIN (
 ORDER BY t.session_id, t.turn_number;
 ```
 
-### 6.3 Observed Results
+The rewritten query applies each filter within its corresponding subquery. This expresses the intention to reduce the rows considered from `judge_scores` and `user_ratings` before joining them with turns.
 
-| Measurement | Original | Rewritten |
-|---|---:|---:|
-| Result rows | 127 | 127 |
-| Observed time | 0.113 s | 0.128 s |
+### 6.3 Results and interpretation
 
-Both queries returned 127 rows, and their execution plans were effectively the same.
+Both versions returned **127 rows**.
 
-SQLite can optimize the predicates and subqueries internally, so the rewritten SQL does not necessarily result in a different physical execution plan. In this experiment, the rewritten query was slightly slower according to the observed timings.
+| Version | Observed execution time |
+|---|---:|
+| Original query | 0.113 s |
+| Rewritten query | 0.128 s |
 
-**Conclusion:** Predicate pushdown was tested, but no runtime improvement was demonstrated.
+The rewritten query was slightly slower in this run. This does not mean predicate pushdown is inherently worse. SQLite can transform equivalent SQL formulations into similar execution strategies, and the measured difference may reflect normal runtime variation.
 
----
+The experiment demonstrates that rewriting SQL does not necessarily improve performance when the database optimizer already produces an effective plan.
 
-## 7. Task 5 — Concurrency Observations
-
-This section summarizes the observed transaction experiments. The detailed, step-by-step procedures are maintained separately in `concurrency_demo.sql`.
-
-### 7.1 Isolation Experiment
-
-In the earlier A1 experiment, Connection A inserted a moderation decision but did not commit it immediately. Connection B read the previously committed video state and observed `live`.
-
-Because A inserted a separate row and B read the existing video row, these operations did not create a conflict cycle. The observed behaviour is consistent with a serial order in which B's read occurs before A's insertion and commit.
-
-This experiment demonstrates visibility of committed data; it does not demonstrate a non-serializable schedule.
-
-The A1 experiment uses the earlier schema and should be treated as an A1 result rather than executed unmodified against the A2 database.
-
-### 7.2 Lost-Update Demonstration
-
-Two autocommit connections read the same initial moderation state, `live`. Connection A then updated the state to `taken_down`, while Connection B subsequently updated it to `demoted`.
-
-The final value was `demoted`, overwriting A's update. This demonstrates an application-level lost update caused by separate reads and writes without a transaction spanning the entire read-modify-write operation.
-
-### 7.3 Prevention Using `BEGIN IMMEDIATE`
-
-Connection A began a write transaction using:
-
-```sql
-BEGIN IMMEDIATE;
-```
-
-It read the current state and updated the video to `taken_down`, keeping the transaction open. Connection B then attempted a conflicting update and received a SQLite busy/database-locked error while A held the write transaction.
-
-After A committed, B could retry its operation. This serializes the competing writes but can reduce write concurrency and require retry handling.
-
-The test video was restored to `live` after the experiment, and the final state was verified.
+**Execution-plan note:** The recorded experiment notes indicate that the two plans were effectively the same, but the exact line-by-line `EXPLAIN QUERY PLAN` output was not retained. Therefore, this document does not reproduce unverified plan text. The two queries can be checked directly in SQLite if exact output is required.
 
 ---
 
-## 8. Summary of Index Changes
+## 7. Overall Findings
 
-The following indexes were added for the investigated queries:
+The experiments highlighted several practical points about SQLite query optimisation:
 
-```sql
-CREATE INDEX idx_impressions_time_video
-ON impressions(occurred_at, video_id);
+1. **Index column order matters.** The index beginning with `occurred_at` allowed SQLite to search by the timestamp range in F1.
+2. **Composite indexes can support multiple conditions.** The videos index supports the creator and moderation-state lookup in F2.
+3. **Indexes can change the access path without removing later work.** F1 still requires grouping, distinct counting, and sorting after the index change.
+4. **Execution plans and timings answer different questions.** A plan shows the selected operations, while a timing measures one execution under particular conditions.
+5. **Query rewrites are not guaranteed to be faster.** The two predicate-pushdown versions returned the same number of rows and had similar recorded plans, with a small timing difference.
+6. **Benchmark conditions matter.** The rolling timestamp window, result-fetching overhead, caching, and long-running queries can all affect observed timings.
 
-CREATE INDEX idx_f2_videos_creator_state
-ON videos(creator_id, moderation_state);
+Overall, the most convincing measured improvement was F1, where the timestamp index changed the plan from a scan to an indexed range search and the recorded runtime decreased substantially. For F2 and F12, the plans provide useful evidence of how SQLite uses the new indexes, but the available timing data is not sufficient to claim a controlled end-to-end speedup.
 
-CREATE INDEX idx_vs_reached_impression
-ON viewing_segments(reached_end, impression_id);
-```
+## 8. Reproducibility
 
-| Query | Main plan change | Performance conclusion |
-|---|---|---|
-| F1 | Full index scan changed to timestamp range search | Observed diagnostic timing improved from about 20 s to 2.354 s |
-| F2 | Video lookup uses both `creator_id` and `moderation_state` | No reliable full-query timing comparison |
-| F12 | Viewing-segment scan changed to composite-index search | Same 210,602 result rows; timing was inconclusive |
+To reproduce the analysis:
 
-The indexes should be evaluated against the workload as a whole. Additional indexes require storage and can add overhead to inserts, updates, and deletes. The final decision should consider query plans, representative workloads, and repeatable measurements rather than relying on a single timing.
+1. Use the database generated with the assignment's required scale.
+2. Execute the original queries from `queries.sql` and record their baseline plans.
+3. Apply the index definitions in `indexes.sql`.
+4. Run `EXPLAIN QUERY PLAN` again for each query and compare the access paths.
+5. Execute the original and rewritten Task 4 queries and compare their results.
+6. Record timings together with the result counts and relevant database conditions.
 
----
-
-## 9. Reproducibility Notes
-
-- Use SQLite's `EXPLAIN QUERY PLAN` to capture the plans.
-- Compare plans before and after creating the indexes.
-- Use the same query text, database state, and cutoff when comparing runtimes.
-- Record whether timing includes result fetching in DBeaver.
-- Do not interpret a single noisy timing as proof of an improvement or regression.
-- Keep the detailed index definitions in `indexes.sql` and the transaction procedures in `concurrency_demo.sql`.
-- Keep this file as the written explanation of the observed plans and experimental limitations.
+The SQL scripts and inline comments in the repository provide the execution context for the experiments. Timings should be treated as environment-specific observations rather than guaranteed performance figures.
