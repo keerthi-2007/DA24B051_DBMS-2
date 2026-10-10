@@ -1,4 +1,4 @@
-# Query Plan Analysis — DBMS Assignment 2
+# Query Plan Analysis
 
 ## 1. Overview
 
