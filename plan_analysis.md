@@ -75,24 +75,15 @@ The viewing segments table contains **7,350,347 rows**. The database page size i
 
 Using these values, the average allocated space per row is approximately:
 
-\[
-\frac{700,424,192}{7,350,347}
-\approx 95.29\text{ bytes per row}
-\]
+\frac{700,424,192}{7,350,347} \approx 95.29 \text{ bytes per row}
 
 An approximate estimate of the number of rows that fit on a page is:
 
-\[
-\left\lfloor \frac{4096}{95.29}\right\rfloor
-=42
-\]
+\left\lfloor \frac{4096}{95.29} \right\rfloor = 42
 
 The estimated number of pages is therefore:
 
-\[
-\left\lceil\frac{7,350,347}{42}\right\rceil
-\approx 175,009\text{ pages}
-\]
+\left\lceil \frac{7,350,347}{42} \right\rceil \approx 175,009 \text{ pages}
 
 These figures are estimates rather than an exact SQLite page-level scan count. Actual page occupancy depends on record headers, B-tree structure, free space, and other database overhead.
 
